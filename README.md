@@ -1,3 +1,17 @@
+### Note: modifications done in this repository
+
+Extend **Detection**, **Track**, **NearestNeighborDistanceMetric**, and **Tracker** to carry and fuse a second appearance feature (`JPM local parts`) alongside the original `global feature`. Fusion happens at the distance scalar level via a configurable local_weight parameter. Falls back to global-only for extractors that do not produce local features.
+
+TransReID with JPM produces two distinct feature spaces per detection (global CLS token `768-dim`, local part vectors `3072-dim`). Feature-level blending loses discriminative power. Distance-level fusion preserves each signal independently and only combines at the match/reject decision boundary.
+
+All new fields default to `None or []`. Fusion activates only when all three conditions hold: 
+
+1. detection has a `local feature`
+2. track has a `local gallery`
+3. `local_weight > 0`. 
+
+Single-feature extractors are completely unaffected.
+
 # Deep SORT
 
 ## Introduction
