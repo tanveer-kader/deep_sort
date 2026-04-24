@@ -96,6 +96,43 @@ def _nn_cosine_distance(x, y):
     return distances.min(axis=0)
 
 
+def _nn_cosine_distance_parts(x, y, part_weights, part_dim=768):
+    """Nearest-neighbor cosine distance with per-part weighting for JPM features.
+
+    Parameters
+    ----------
+    x : ndarray
+        An NxK gallery matrix (K = num_parts x part_dim, e.g. 3072).
+    y : ndarray
+        An MxK query matrix.
+    part_weights : array_like
+        Weights for each part (must sum to 1.0). Length = num_parts.
+        Order: [head, upper_torso, lower_torso, legs].
+    part_dim : int
+        Dimensionality of each part vector. Default 768 (TransReID ViT-Base).
+
+    Returns
+    -------
+    ndarray
+        A vector of length M — nearest-neighbour weighted part distance per query.
+    """
+    x, y = np.asarray(x), np.asarray(y)
+    num_parts = len(part_weights)
+    part_weights = np.asarray(part_weights, dtype=np.float32)
+    # reshape to (N, num_parts, part_dim) and (M, num_parts, part_dim)
+    x_parts = x.reshape(len(x), num_parts, part_dim)
+    y_parts = y.reshape(len(y), num_parts, part_dim)
+    # normalize each part independently
+    x_parts = x_parts / (np.linalg.norm(x_parts, axis=2, keepdims=True) + 1e-8)
+    y_parts = y_parts / (np.linalg.norm(y_parts, axis=2, keepdims=True) + 1e-8)
+    # cosine distance per part: shape (N, M, num_parts)
+    part_dists = 1.0 - np.einsum('npd,mpd->nmp', x_parts, y_parts)
+    # weighted sum over parts: shape (N, M)
+    weighted = np.dot(part_dists, part_weights)
+    # nearest neighbour over gallery (min over N): shape (M,)
+    return weighted.min(axis=0)
+
+
 class NearestNeighborDistanceMetric(object):
     """
     A nearest neighbor distance metric that, for each target, returns
@@ -120,7 +157,8 @@ class NearestNeighborDistanceMetric(object):
 
     """
 
-    def __init__(self, metric, matching_threshold, budget=None, local_weight=0.0):
+    def __init__(self, metric, matching_threshold, budget=None,
+                 local_weight=0.0, fusion_margin=0.05, part_weights=None):
         if metric == "euclidean":
             self._metric = _nn_euclidean_distance
         elif metric == "cosine":
@@ -134,6 +172,14 @@ class NearestNeighborDistanceMetric(object):
         # local_weight: fraction of distance from JPM local features (0.0 = global only)
         # e.g. 0.3 → final_dist = 0.7 * global_dist + 0.3 * local_dist
         self.local_weight = local_weight
+        # fusion_margin: JPM only activates when global_dist is within ±margin of threshold.
+        # Prevents JPM from overriding confident global decisions (clear match or clear reject).
+        # 0.0 → JPM never activates; 0.05 → tight uncertain zone (recommended); 0.10 → wider
+        self.fusion_margin = fusion_margin
+        # part_weights: per-part weights for JPM local distance [head, upper, lower, legs].
+        # None → flat 3072-dim cosine (equal 25% per part, same as before).
+        # [0.4, 0.2, 0.2, 0.2] → head-heavy, best for same-costume datasets.
+        self.part_weights  = part_weights
         self.local_samples = {}  # Dict[track_id -> List[ndarray(3072,)]]
 
     def partial_fit(self, features, targets, active_targets, local_features=None):
@@ -198,11 +244,22 @@ class NearestNeighborDistanceMetric(object):
         if (local_features is not None
                 and self.local_weight > 0.0
                 and len(self.local_samples) > 0):
+            lo = self.matching_threshold - self.fusion_margin
+            hi = self.matching_threshold + self.fusion_margin
             for i, target in enumerate(targets):
                 if target in self.local_samples:
-                    local_dist = self._metric(self.local_samples[target], local_features)
-                    cost_matrix[i, :] = ((1.0 - self.local_weight) * cost_matrix[i, :]
-                                         + self.local_weight * local_dist)
+                    global_row = cost_matrix[i, :]
+                    uncertain  = (global_row > lo) & (global_row < hi)
+                    if uncertain.any():
+                        if self.part_weights is not None:
+                            local_dist = _nn_cosine_distance_parts(
+                                self.local_samples[target], local_features, self.part_weights)
+                        else:
+                            local_dist = self._metric(self.local_samples[target], local_features)
+                        fused = ((1.0 - self.local_weight) * global_row
+                                 + self.local_weight * local_dist)
+                        cost_matrix[i, uncertain] = fused[uncertain]
+                    # clear decisions (global_dist outside uncertain zone) → unchanged
                 # else: no local gallery for this track yet → keep global-only row
 
         return cost_matrix
