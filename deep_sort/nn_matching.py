@@ -244,8 +244,8 @@ class NearestNeighborDistanceMetric(object):
         if (local_features is not None
                 and self.local_weight > 0.0
                 and len(self.local_samples) > 0):
-            lo = self.matching_threshold - self.fusion_margin
-            hi = self.matching_threshold + self.fusion_margin
+            lo = max(0.0, self.matching_threshold - self.fusion_margin)
+            hi = min(1.0, self.matching_threshold + self.fusion_margin)
             for i, target in enumerate(targets):
                 if target in self.local_samples:
                     global_row = cost_matrix[i, :]
